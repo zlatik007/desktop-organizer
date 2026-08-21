@@ -15,7 +15,7 @@
 
 ## Installation
 
-1. Go to the [Releases](https://github.com/zlatik007/desktop_organizer/releases) page
+1. Go to the [Releases](https://github.com/zlatik007/desktop-organizer/releases) page
 2. Download the archive of the latest version
 3. Extract the archive to a folder of your choice
 4. Run `Desktop Organizer.exe`
@@ -28,6 +28,11 @@ Full documentation is available in the following languages:
 
 - **English** — [readme_eng.md](docs/english/readme_eng.md)
 - **Русский** — [readme_ru.md](docs/russian/readme_ru.md)
+
+Changelog:
+
+- **English** — [changelog.md](docs/english/changelog.md)
+- **Русский** — [changelog.md](docs/russian/changelog.md)
 
 ## License
 

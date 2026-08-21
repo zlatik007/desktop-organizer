@@ -1,4 +1,5 @@
 import sys
+import ctypes
 import os
 import re
 import time
@@ -14,9 +15,10 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 from ctypes import wintypes, Structure, c_int, c_uint, c_void_p, c_wchar_p, byref, windll, create_unicode_buffer, cast, POINTER
-from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QAction
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QMainWindow,
     QWidget,
@@ -34,10 +36,14 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QDialog,
     QMenu)
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+# Name of the source script. Used to recognize widget shortcuts that a dev
+# (source-code) run left bound to python, so the packaged app can reclaim
+# them and the widget launches the installed program instead of the source.
+APP_SCRIPT_NAME = "desktop_organizer.py"
 # GitHub repo that hosts the release downloads for update checks.
-UPDATE_CHECK_URL = "https://api.github.com/repos/zlatik007/desktop_organizer/releases/latest"
-RELEASES_PAGE_URL = "https://github.com/zlatik007/desktop_organizer/releases/latest"
+UPDATE_CHECK_URL = "https://api.github.com/repos/zlatik007/desktop-organizer/releases/latest"
+RELEASES_PAGE_URL = "https://github.com/zlatik007/desktop-organizer/releases/latest"
 def _version_tuple(version: str) -> tuple:
     """Parse a version string into a comparable tuple of integers."""
     parts = tuple(int(p) for p in re.findall(r"\d+", version or ""))
@@ -133,6 +139,27 @@ def save_item_names(data: dict):
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception:
         pass
+def remove_item_paths_from_widget(widget_name: str, paths: set):
+    """Remove the given normalized paths from a widget's storage
+    (widgets.json) and from the custom-names file (names.json). Returns the
+    number of entries actually removed from storage."""
+    data = load_widgets_data()
+    stored = data.get(widget_name, [])
+    kept = [p for p in stored if not (isinstance(p, str) and str(Path(p)) in paths)]
+    removed = len(stored) - len(kept)
+    data[widget_name] = kept
+    save_widgets_data(data)
+    names_data = load_item_names()
+    overrides = names_data.get(widget_name)
+    if isinstance(overrides, dict):
+        changed = False
+        for p in paths:
+            if p in overrides:
+                del overrides[p]
+                changed = True
+        if changed:
+            save_item_names(names_data)
+    return removed
 _ORIGINAL_EXCEPTHOOK = sys.excepthook
 def _log_unhandled_exception(exc_type, exc_value, exc_tb):
     """Log unhandled exceptions to crash.log next to the program."""
@@ -216,10 +243,170 @@ def _speech_worker_loop():
                     engine.stop()
             except Exception:
                 pass
-def announce_speech(text: str):
+_nvda_dll = None
+_nvda_speak_func = None
+_nvda_cancel_func = None
+_nvda_checked = False
+
+
+def _app_base_dir() -> Path:
+    """Directory of the running app: the exe for frozen builds, the script
+    folder when running from source."""
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+
+
+def _nvda_controller_client_candidates() -> list:
+    """Possible locations of nvdaControllerClient.dll.
+
+    Modern NVDA no longer installs this DLL; NV Access ships it separately
+    (controllerClient.zip) for applications to bundle with themselves. The
+    copies bundled next to this app (nvdaControllerClient_x64.dll and
+    _x86.dll in the project root, named by architecture) are tried first,
+    then a copy with the original name next to the app, and finally NVDA's
+    own install folder for older NVDA versions that still shipped the DLL
+    there.
+    """
+    base = _app_base_dir()
+    is_64bit = ctypes.sizeof(c_void_p) * 8 == 64
+    if is_64bit:
+        candidates = [base / "nvdaControllerClient_x64.dll", base / "nvdaControllerClient_x86.dll"]
+    else:
+        candidates = [base / "nvdaControllerClient_x86.dll", base / "nvdaControllerClient_x64.dll"]
+    # A manually placed copy with the original name also works.
+    candidates.append(base / "nvdaControllerClient.dll")
+    for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+        pf = os.environ.get(env_var)
+        if pf:
+            candidates.append(Path(pf) / "NVDA" / "nvdaControllerClient.dll")
+    # Portable installs commonly live under AppData\Local\Programs.
+    candidates.append(Path.home() / "AppData" / "Local" / "Programs" / "NVDA" / "nvdaControllerClient.dll")
+    try:
+        import winreg
+    except Exception:
+        winreg = None
+    if winreg is not None:
+        for hive, key in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NVDA"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\NVDA"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NVDA"),
+        ):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    loc, _ = winreg.QueryValueEx(k, "InstallLocation")
+                if loc:
+                    candidates.append(Path(loc) / "nvdaControllerClient.dll")
+            except Exception:
+                continue
+    seen = set()
+    unique = []
+    for c in candidates:
+        try:
+            s = str(c.resolve())
+        except Exception:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        unique.append(c)
+    return unique
+
+
+def _load_nvda_client():
+    """Load NVDA's controller client DLL (once) so announcements are spoken
+    by NVDA itself with the user's usual voice."""
+    global _nvda_dll, _nvda_speak_func, _nvda_cancel_func, _nvda_checked
+    if _nvda_checked:
+        return _nvda_dll
+    _nvda_checked = True
+    if sys.platform != "win32":
+        return None
+    for dll_path in _nvda_controller_client_candidates():
+        try:
+            dll = ctypes.WinDLL(str(dll_path))
+        except Exception:
+            continue  # wrong architecture or missing dependencies
+        try:
+            speak_func = getattr(dll, "nvdaController_speakText", None)
+            if speak_func is None:
+                speak_func = getattr(dll, "nvdaControllerClient_speakText", None)
+            test_func = getattr(dll, "nvdaController_testIfRunning", None)
+            if speak_func is None or test_func is None:
+                continue
+            speak_func.argtypes = [c_wchar_p]
+            speak_func.restype = c_int
+            test_func.argtypes = []
+            test_func.restype = c_int
+            cancel_func = getattr(dll, "nvdaController_cancelSpeech", None)
+            if cancel_func is not None:
+                cancel_func.argtypes = []
+                cancel_func.restype = c_int
+            _nvda_dll = dll
+            _nvda_speak_func = speak_func
+            _nvda_cancel_func = cancel_func
+            return dll
+        except Exception:
+            continue
+    return None
+
+
+def nvda_speak(text: str, cancel: bool = False) -> bool:
+    """Ask a running NVDA to speak text with its own synthesizer. With
+    cancel, pending NVDA speech is interrupted first so the new message is
+    heard immediately. Returns False when NVDA is not available or running."""
+    if _load_nvda_client() is None:
+        return False
+    try:
+        if _nvda_dll.nvdaController_testIfRunning() != 0:
+            return False
+        if cancel and _nvda_cancel_func is not None:
+            _nvda_cancel_func()
+        _nvda_speak_func(text)
+        return True
+    except Exception:
+        return False
+
+
+def sapi_speak(text: str) -> bool:
+    """Speak text through the Windows SAPI voice via PowerShell.
+
+    Used only as a fallback when NVDA is not available or not running; the
+    app prefers speaking through NVDA's own synthesizer via the bundled
+    nvdaControllerClient.dll."""
+    if sys.platform != "win32":
+        return False
+    try:
+        ps_cmd = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Speak('{text.replace(chr(39), chr(39) * 2)}')"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def announce_speech(text: str, interrupt: bool = False):
+    # Order: NVDA itself (via the bundled controller client DLL), then the
+    # built-in Windows system voice (SAPI), then pyttsx3.
+    if nvda_speak(text, cancel=interrupt):
+        return
+    if sapi_speak(text):
+        return
     try:
         global _speech_worker_started
         with _speech_lock:
+            if interrupt:
+                # Drop queued announcements so a rapid series (e.g. drag
+                # previews) does not build up a speech backlog.
+                try:
+                    while True:
+                        _speech_queue.get_nowait()
+                except queue.Empty:
+                    pass
             if not _speech_worker_started:
                 _speech_worker_started = True
                 threading.Thread(target=_speech_worker_loop, name="tts-speech", daemon=True).start()
@@ -336,7 +523,8 @@ def _confirm_install_update(parent, zip_path: Path):
     if box.clickedButton() == install_btn:
         _start_update_install(parent, zip_path)
 def _start_update_install(parent, zip_path: Path):
-    """Launch the hidden updater script, then close the app so it can be replaced."""
+    """Apply the downloaded update: launch a hidden PowerShell script that
+    replaces the program files and restarts the app."""
     try:
         script = _write_updater_script(zip_path)
         subprocess.Popen(
@@ -455,9 +643,6 @@ def _shell_delete(path: Path, to_recycle_bin: bool) -> bool:
         os.chmod(path_p, stat.S_IWRITE)
     except Exception:
         pass
-    if sys.platform != "win32":
-        path_p.unlink()
-        return not path_p.exists()
     path_str = str(path_p) + '\0'
     buffer = create_unicode_buffer(path_str)
     fileop = SHFILEOPSTRUCTW()
@@ -493,8 +678,6 @@ def move_to_recycle_bin(path: Path) -> bool:
 def _notify_shell_file_deleted(path: Path):
     """Notify Explorer that a file was deleted so desktop icons refresh."""
     try:
-        if sys.platform != "win32":
-            return
         SHCNE_DELETE = 0x00000004
         SHCNE_UPDATEDIR = 0x00001000
         SHCNF_PATHW = 0x0005
@@ -540,10 +723,6 @@ def resolve_shortcut_targets_batch(shortcut_paths):
     result = {}
     if not shortcut_paths:
         return result
-    if sys.platform != "win32":
-        for p in shortcut_paths:
-            result[str(p)] = Path(p)
-        return result
     resolved_map = {}
     for p in shortcut_paths:
         try:
@@ -584,15 +763,18 @@ def resolve_shortcut_targets_batch(shortcut_paths):
     return result
 def _write_desktop_shortcut(shortcut_path: Path, widget_name: str):
     """Create (or overwrite) a .lnk at shortcut_path that opens the given
-    widget with the currently running copy of the program."""
+    widget with the installed (packaged) copy of the program.
+
+    Only the packaged copy creates or rewrites widget shortcuts. A copy
+    launched from source code must not bind a desktop shortcut to the
+    source folder: that would make the widget keep launching the dev copy
+    (and reading the dev folder's data) instead of the installed program.
+    """
+    if not getattr(sys, "frozen", False):
+        return
     target_path = Path(sys.executable).resolve()
-    main_script = Path(sys.argv[0]).resolve()
-    # From source: python + script path. Frozen: binary + widget name.
-    if getattr(sys, 'frozen', False):
-        args_str = f'"{widget_name}"'
-    else:
-        args_str = f'"{main_script}" "{widget_name}"'
-    work_dir = main_script.parent
+    args_str = f'"{widget_name}"'
+    work_dir = Path(sys.argv[0]).resolve().parent
     ps_cmd = (
         f"$WshShell = New-Object -ComObject WScript.Shell; "
         f"$Shortcut =$WshShell.CreateShortcut('{_ps_escape(str(shortcut_path))}'); "
@@ -602,11 +784,17 @@ def _write_desktop_shortcut(shortcut_path: Path, widget_name: str):
         f"$Shortcut.Save()"
     )
     subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], creationflags=CREATE_NO_WINDOW)
-def create_desktop_shortcut(widget_name: str):
+def create_desktop_shortcut(widget_name: str) -> bool:
+    """Create (or refresh) the desktop shortcut for a widget. Returns True
+    when the shortcut is in place; False when the running copy cannot
+    create shortcuts (a dev copy started from source code) or on failure."""
+    if not getattr(sys, "frozen", False):
+        return False
     try:
         _write_desktop_shortcut(get_desktop_shortcut_path(widget_name), widget_name)
+        return True
     except Exception:
-        pass
+        return False
 def _parse_quoted_args(arguments: str) -> list:
     """Extract the double-quoted tokens from a shortcut's argument string.
     Widget names may contain spaces, so a naive split would break them."""
@@ -631,33 +819,43 @@ def _parse_widget_name_from_args(arguments: str):
     if not tokens:
         return None
     if getattr(sys, 'frozen', False):
-        return tokens[0] if len(tokens) == 1 else None
+        if len(tokens) == 1:
+            return tokens[0]
+        # A shortcut left over from a dev (source-code) run: script + widget.
+        if len(tokens) >= 2 and os.path.basename(tokens[0]).lower() == APP_SCRIPT_NAME:
+            return tokens[1]
+        return None
     return tokens[1] if len(tokens) >= 2 else None
 def _shortcut_is_ours(target, arguments: str) -> bool:
     """True when a desktop shortcut was created by (a previous copy of) this
     program: the target is our executable and the arguments carry a widget
-    name, or it runs our script from a python interpreter."""
+    name, or it runs our script from a python interpreter.
+
+    In a packaged build, shortcuts that a dev (source-code) run left bound
+    to python + our script count as ours too, so repair reclaims them and
+    the widget launches the installed program instead of the source code.
+    """
     if not target or not arguments:
         return False
     try:
         target_name = Path(target).name.lower()
     except Exception:
         return False
+    tokens = _parse_quoted_args(arguments)
     if getattr(sys, 'frozen', False):
-        return target_name == Path(sys.executable).name.lower() and bool(_parse_widget_name_from_args(arguments))
+        if target_name == Path(sys.executable).name.lower():
+            return len(tokens) == 1
+        if target_name.startswith("python"):
+            return len(tokens) >= 2 and os.path.basename(tokens[0]).lower() == APP_SCRIPT_NAME
+        return False
     if not target_name.startswith("python"):
         return False
-    tokens = _parse_quoted_args(arguments)
     return len(tokens) >= 2 and os.path.basename(tokens[0]).lower() == os.path.basename(Path(sys.argv[0])).lower()
 def resolve_shortcut_details_batch(shortcut_paths):
     """Resolve the target path and argument string of many .lnk files with a
     single PowerShell call. Returns {resolved_lnk_path: (target, arguments)}."""
     result = {}
     if not shortcut_paths:
-        return result
-    if sys.platform != "win32":
-        for p in shortcut_paths:
-            result[str(Path(p).resolve())] = (Path(p), "")
         return result
     resolved_map = {}
     for p in shortcut_paths:
@@ -712,8 +910,6 @@ def repair_orphaned_desktop_shortcuts():
     program and target a missing or different executable are recreated in
     place so they keep working and open the widget with the new version.
     """
-    if sys.platform != "win32":
-        return
     try:
         current_exe = str(Path(sys.executable).resolve()).lower()
     except Exception:
@@ -758,15 +954,24 @@ def repair_orphaned_desktop_shortcuts():
                 _write_desktop_shortcut(p, widget_name)
             except Exception:
                 pass
-def delete_desktop_shortcut(widget_name: str):
+def delete_desktop_shortcut(widget_name: str) -> bool:
+    """Remove the desktop shortcut(s) for a widget. Returns True when the
+    removal was attempted; False when the running copy may not manage
+    shortcuts (a dev copy started from source code)."""
+    if not getattr(sys, "frozen", False):
+        # Dev copies must not remove the installed app's desktop shortcuts;
+        # the source run works only with its own folder's data.
+        return False
     try:
         shortcut_path = get_desktop_shortcut_path(widget_name)
         public_shortcut = get_public_desktop_path() / f"{widget_name}.lnk"
-        for sp in (shortcut_path, public_shortcut):
+        paths = (shortcut_path, public_shortcut)
+        for sp in paths:
             if sp.exists() and not move_to_recycle_bin(sp):
                 delete_permanently(sp)
+        return True
     except Exception:
-        pass
+        return False
 class AccessibleSmartButton(QPushButton):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
@@ -1065,11 +1270,11 @@ class ExitConfirmDialog(QDialog):
         buttons_layout = QHBoxLayout()
         yes_btn = QPushButton(tr("yes"))
         yes_btn.setAutoDefault(False)
+        yes_btn.setDefault(True)
         yes_btn.setAccessibleName(tr("yes"))
         yes_btn.clicked.connect(self.accept)
         no_btn = QPushButton(tr("no"))
         no_btn.setAutoDefault(False)
-        no_btn.setDefault(True)
         no_btn.setAccessibleName(tr("no"))
         no_btn.clicked.connect(self.reject)
         buttons_layout.addWidget(yes_btn)
@@ -1102,26 +1307,196 @@ class RenameItemDialog(QDialog):
         layout.addLayout(buttons_layout)
     def new_name(self):
         return self.name_input.text().strip()
+class DeleteItemsDialog(QDialog):
+    """Mark widget items with checkboxes and remove the marked ones after
+    confirmation. Files and folders on disk are never touched."""
+
+    def __init__(self, widget_name, parent=None):
+        super().__init__(parent)
+        self.widget_name = widget_name or ""
+        self.removed_count = 0
+        self.removed_name = ""
+        self.setWindowTitle(tr("delete_items_title"))
+        self.resize(460, 420)
+        layout = QVBoxLayout(self)
+        prompt = QLabel(tr("delete_items_prompt"))
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
+        self.items_list = QListWidget()
+        data = load_widgets_data()
+        names_data = load_item_names()
+        for p_str in data.get(self.widget_name, []):
+            if not isinstance(p_str, str):
+                continue
+            try:
+                p = Path(p_str)
+            except Exception:
+                continue
+            item = QListWidgetItem(item_display_name_for(self.widget_name, p, names_data))
+            item.setData(Qt.ItemDataRole.UserRole, str(p))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.items_list.addItem(item)
+        layout.addWidget(self.items_list)
+        buttons_layout = QHBoxLayout()
+        delete_btn = QPushButton(tr("delete_item_btn"))
+        delete_btn.setAutoDefault(False)
+        delete_btn.setDefault(False)
+        delete_btn.clicked.connect(self._confirm_delete)
+        cancel_btn = QPushButton(tr("cancel"))
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.setDefault(False)
+        cancel_btn.clicked.connect(self.reject)
+        buttons_layout.addWidget(delete_btn)
+        buttons_layout.addWidget(cancel_btn)
+        layout.addLayout(buttons_layout)
+
+    def showEvent(self, event):
+        """Focus the checklist on open so the user can mark items right away
+        (arrow keys to move, Space to check/uncheck)."""
+        super().showEvent(event)
+        if self.items_list.count() > 0:
+            self.items_list.setCurrentRow(0)
+            self.items_list.setFocus()
+
+    def _checked_items(self):
+        checked = []
+        for i in range(self.items_list.count()):
+            item = self.items_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) and item.checkState() == Qt.CheckState.Checked:
+                checked.append(item)
+        return checked
+
+    def _confirm_delete(self):
+        checked = self._checked_items()
+        if not checked:
+            announce_speech(tr("check_items_first"))
+            return
+        if len(checked) == 1:
+            confirm_text = tr("delete_item_confirm", name=checked[0].text())
+        else:
+            confirm_text = tr("delete_items_confirm", count=len(checked))
+        msg_box = _message_box(self, tr("delete_confirm_title"), confirm_text)
+        yes_btn = msg_box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
+        no_btn = msg_box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
+        msg_box.setDefaultButton(no_btn)
+        # The message box's accessible name makes NVDA read the question.
+        msg_box.exec()
+        if msg_box.clickedButton() != yes_btn:
+            return
+        seen = set()
+        names = []
+        for item in checked:
+            path_str = item.data(Qt.ItemDataRole.UserRole)
+            if not path_str:
+                continue
+            target_path = str(Path(path_str))
+            if target_path in seen:
+                continue
+            seen.add(target_path)
+            names.append(item.text())
+        if not seen:
+            return
+        remove_item_paths_from_widget(self.widget_name, seen)
+        self.removed_count = len(names)
+        self.removed_name = names[0] if len(names) == 1 else ""
+        self.accept()
+class ItemOrderListWidget(QListWidget):
+    """QListWidget that supports drag & drop reordering. Emits signals so
+    the widget can save the new order and speak the item's live position
+    while the user drags it."""
+    order_changed = pyqtSignal(object, int)  # (moved item, new row)
+    drag_position = pyqtSignal(object, int)  # (dragged item, preview row)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_item = None
+        self._last_drag_row = None
+
+    def dragEnterEvent(self, event):
+        super().dragEnterEvent(event)
+        if event.isAccepted():
+            self._drag_item = self.currentItem()
+            self._last_drag_row = None
+
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        if not event.isAccepted():
+            return
+        dragged = self._drag_item
+        if dragged is None:
+            dragged = self.currentItem()
+        if dragged is None:
+            return
+        row = self._target_row_for(event)
+        if row != self._last_drag_row:
+            self._last_drag_row = row
+            self.drag_position.emit(dragged, row)
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        if event.isAccepted():
+            dragged = self._drag_item
+            if dragged is None:
+                dragged = self.currentItem()
+            if dragged is not None:
+                self.order_changed.emit(dragged, self.row(dragged))
+            self._last_drag_row = None
+            self._drag_item = None
+
+    def _target_row_for(self, event) -> int:
+        """Row the dragged item would occupy if dropped at the cursor."""
+        count = self.count()
+        idx = self.indexAt(event.position().toPoint())
+        if not idx.isValid():
+            return count
+        row = idx.row()
+        if self.dropIndicatorPosition() == QAbstractItemView.DropIndicatorPosition.BelowItem:
+            row += 1
+        return max(0, min(row, count))
+
+
 class WidgetViewDialog(QDialog):
     def __init__(self, widget_name, parent=None):
         super().__init__(parent)
         self.widget_name = widget_name or ""
         self._last_launch_time = 0
+        self._last_drag_announce = 0
         self.setWindowTitle(self.widget_name)
         self.resize(550, 450)
         layout = QVBoxLayout(self)
         self.path_label = QLabel(self.widget_name)
         layout.addWidget(self.path_label)
-        self.items_list = QListWidget()
+        self.items_list = ItemOrderListWidget()
         self.items_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.items_list.customContextMenuRequested.connect(self.show_item_context_menu)
+        # Items can be reordered by dragging or with the move buttons.
+        self.items_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.items_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Deleting is done with item checkboxes (mark items, then Delete).
+        self.items_list.order_changed.connect(self.on_items_reordered)
+        self.items_list.drag_position.connect(self._announce_drag_position)
         # Rename is available from the context menu and via the F2 hotkey.
         self.rename_action = QAction(tr("rename_item_btn"), self)
         self.rename_action.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self.rename_action.triggered.connect(self.rename_selected_item)
         self.addAction(self.rename_action)
+        self.move_up_action = QAction(tr("move_up_btn"), self)
+        self.move_up_action.setShortcut(QKeySequence("Alt+Up"))
+        self.move_up_action.triggered.connect(lambda: self.move_selected_item(-1))
+        self.addAction(self.move_up_action)
+        self.move_down_action = QAction(tr("move_down_btn"), self)
+        self.move_down_action.setShortcut(QKeySequence("Alt+Down"))
+        self.move_down_action.triggered.connect(lambda: self.move_selected_item(1))
+        self.addAction(self.move_down_action)
+        self.delete_action = QAction(tr("delete_item_btn"), self)
+        self.delete_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        self.delete_action.triggered.connect(self.delete_selected_item)
+        self.addAction(self.delete_action)
         self.items_menu = QMenu(self)
         self.items_menu.addAction(self.rename_action)
+        self.items_menu.addSeparator()
+        self.items_menu.addAction(self.delete_action)
         layout.addWidget(self.items_list)
         buttons_layout = QHBoxLayout()
         launch_btn = QPushButton(tr("open_launch"))
@@ -1130,6 +1505,17 @@ class WidgetViewDialog(QDialog):
         launch_btn.setDefault(False)
         launch_btn.clicked.connect(self.launch_or_open_selected_item)
         buttons_layout.addWidget(launch_btn)
+        delete_btn = QPushButton(tr("delete_item_btn"))
+        delete_btn.setAutoDefault(False)
+        delete_btn.setDefault(False)
+        delete_btn.clicked.connect(self.delete_selected_item)
+        buttons_layout.addWidget(delete_btn)
+        shortcut_btn = QPushButton(tr("create_shortcut_btn"))
+        shortcut_btn.setAccessibleName(tr("create_shortcut_acc"))
+        shortcut_btn.setAutoDefault(False)
+        shortcut_btn.setDefault(False)
+        shortcut_btn.clicked.connect(self.create_shortcut_for_this_widget)
+        buttons_layout.addWidget(shortcut_btn)
         close_btn = QPushButton(tr("close"))
         close_btn.setAutoDefault(False)
         close_btn.setDefault(False)
@@ -1138,7 +1524,14 @@ class WidgetViewDialog(QDialog):
         layout.addLayout(buttons_layout)
         self.load_widget_items()
         self.items_list.itemActivated.connect(self.launch_or_open_selected_item)
-        announce_speech(tr("opened_widget", name=self.widget_name))
+
+    def showEvent(self, event):
+        """Put focus on the first list item as soon as the widget opens, so
+        screen reader users immediately hear the first element."""
+        super().showEvent(event)
+        if self.items_list.count() > 0:
+            self.items_list.setFocus()
+
     def load_widget_items(self):
         self.items_list.clear()
         data = load_widgets_data()
@@ -1162,13 +1555,100 @@ class WidgetViewDialog(QDialog):
                 continue
         if self.items_list.count() > 0:
             self.items_list.setCurrentRow(0)
+
+    def move_selected_item(self, delta: int):
+        """Move the selected item one step up (-1) or down (+1) and save the
+        new order so it stays the same on the next open."""
+        current_row = self.items_list.currentRow()
+        target_row = current_row + delta
+        if current_row < 0 or target_row < 0 or target_row >= self.items_list.count():
+            return
+        current_item = self.items_list.item(current_row)
+        if current_item is None or not current_item.data(Qt.ItemDataRole.UserRole):
+            return
+        moved_item = self.items_list.takeItem(current_row)
+        self.items_list.insertItem(target_row, moved_item)
+        self.items_list.setCurrentItem(moved_item)
+        self.save_item_order()
+        self._schedule_position_announce(moved_item, target_row)
+    def on_items_reordered(self, item, row: int):
+        """Save the new order after a drag & drop and speak the result."""
+        self.save_item_order()
+        self._schedule_position_announce(item, row)
+    def _schedule_position_announce(self, item, row: int):
+        """Speak the new position shortly after the move: NVDA first
+        announces the element itself on the focus change, so the delayed
+        message is the last thing spoken and is not cut off."""
+        def _delayed():
+            try:
+                self._announce_item_position(item, row)
+            except RuntimeError:
+                pass  # the dialog was closed before the timer fired
+        QTimer.singleShot(350, _delayed)
+    def _neighbors_of(self, row: int):
+        prev_item = self.items_list.item(row - 1) if row > 0 else None
+        next_item = self.items_list.item(row + 1) if row < self.items_list.count() - 1 else None
+        prev_name = prev_item.text() if prev_item is not None else ""
+        next_name = next_item.text() if next_item is not None else ""
+        return prev_name, next_name
+    def _announce_item_position(self, item, row: int):
+        """Speak where the moved item now sits relative to its neighbours, so
+        screen reader users can keep track while reordering."""
+        prev_name, next_name = self._neighbors_of(row)
+        if not (prev_name or next_name):
+            return
+        if prev_name and next_name:
+            text = tr("item_moved_between", name=item.text(), prev=prev_name, next=next_name)
+        elif next_name:
+            text = tr("item_moved_first", name=item.text(), next=next_name)
+        else:
+            text = tr("item_moved_last", name=item.text(), prev=prev_name)
+        announce_speech(text, interrupt=True)
+    def _announce_drag_position(self, item, row: int):
+        """Live preview while dragging: speak where the item would land and
+        remind that releasing the mouse button applies the move. Throttled so
+        rapid drags do not pile up speech processes."""
+        now = time.time()
+        if now - self._last_drag_announce < 0.7:
+            return
+        self._last_drag_announce = now
+        prev_name, next_name = self._neighbors_of(row)
+        if not (prev_name or next_name):
+            return
+        if prev_name and next_name:
+            text = tr("item_drag_between", name=item.text(), prev=prev_name, next=next_name)
+        elif next_name:
+            text = tr("item_drag_first", name=item.text(), next=next_name)
+        else:
+            text = tr("item_drag_last", name=item.text(), prev=prev_name)
+        announce_speech(text, interrupt=True)
+    def save_item_order(self):
+        """Write the current list order of this widget's items to storage."""
+        paths = []
+        for i in range(self.items_list.count()):
+            item = self.items_list.item(i)
+            path_str = item.data(Qt.ItemDataRole.UserRole)
+            if path_str:
+                paths.append(path_str)
+        data = load_widgets_data()
+        data[self.widget_name] = paths
+        save_widgets_data(data)
     def show_item_context_menu(self, pos):
         item = self.items_list.itemAt(pos)
         if item is None or not item.data(Qt.ItemDataRole.UserRole):
             return
-        if self.items_list.currentItem() is not item:
+        # Keep an existing multi-selection when the click lands on one of its
+        # items, so "Delete" can remove several items at once. Otherwise
+        # select only the clicked item (setCurrentItem clears the old one).
+        if item not in self.items_list.selectedItems():
             self.items_list.setCurrentItem(item)
         self.items_menu.exec(self.items_list.viewport().mapToGlobal(pos))
+    def create_shortcut_for_this_widget(self):
+        """Create (or refresh) the desktop shortcut that opens this widget."""
+        if create_desktop_shortcut(self.widget_name):
+            announce_speech(tr("shortcut_created_announce", name=self.widget_name))
+        else:
+            announce_speech(tr("shortcut_unavailable_announce"))
     def launch_or_open_selected_item(self):
         current_time = time.time()
         if current_time - self._last_launch_time < 0.6:
@@ -1186,10 +1666,7 @@ class WidgetViewDialog(QDialog):
             return
         try:
             announce_speech(tr("launching", name=item_display_name_for(self.widget_name, target_path)))
-            if sys.platform == "win32":
-                os.startfile(str(target_path))
-            else:
-                subprocess.Popen(["xdg-open", str(target_path)])
+            os.startfile(str(target_path))
             settings = load_settings()
             if settings.get("close_widget_on_launch", True):
                 self.accept()
@@ -1231,6 +1708,28 @@ class WidgetViewDialog(QDialog):
                 break
         final_name = new_name or item_display_name(Path(path_str), hide_extension=True)
         announce_speech(tr("item_renamed", name=final_name))
+    def delete_selected_item(self):
+        """Open the deletion dialog: mark the items to remove with checkboxes,
+        confirm, and delete them from this widget. Only the widget's list is
+        changed; files and folders on disk are not touched."""
+        has_items = any(
+            self.items_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.items_list.count())
+        )
+        if not has_items:
+            announce_speech(tr("empty_widget"))
+            return
+        dialog = DeleteItemsDialog(self.widget_name, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.load_widget_items()
+        self.items_list.setFocus()
+        if dialog.removed_count == 1:
+            text = tr("item_removed", name=dialog.removed_name)
+        else:
+            text = tr("items_removed_count", count=dialog.removed_count)
+        # Delay so NVDA finishes announcing the newly focused item first.
+        QTimer.singleShot(350, lambda: announce_speech(text))
 _running_scan_workers = set()
 def _forget_scan_worker(worker):
     _running_scan_workers.discard(worker)
@@ -1352,18 +1851,33 @@ class WidgetCreationWizardDialog(QDialog):
                 self.update_create_button_state()
                 announce_speech(tr("scan_completed_none"))
                 return
-            for name, target_path, lnk_path in desktop_items:
-                display_name = names_overrides.get(str(target_path)) or name
-                self._add_checkable_item(display_name, target_path, lnk_path,
-                                         self.is_editing and safe_resolve_str(target_path) in existing_paths)
             if self.is_editing:
-                scanned_paths_lower = {safe_resolve_str(item[1]) for item in desktop_items}
+                # Existing widget items keep their saved order; desktop items
+                # that are not part of the widget yet are appended after.
+                scanned_by_path = {}
+                for name, target_path, lnk_path in desktop_items:
+                    scanned_by_path.setdefault(safe_resolve_str(target_path), (name, target_path, lnk_path))
+                added_paths = set()
                 for p in saved_paths:
-                    if isinstance(p, str):
-                        path = Path(p)
-                        if path.exists() and safe_resolve_str(path) not in scanned_paths_lower:
-                            display_name = names_overrides.get(p) or item_display_name(path)
-                            self._add_checkable_item(display_name, path, checked=True)
+                    if not isinstance(p, str):
+                        continue
+                    path = Path(p)
+                    entry = scanned_by_path.get(safe_resolve_str(path))
+                    if entry is not None:
+                        name, target_path, lnk_path = entry
+                        display_name = names_overrides.get(str(target_path)) or name
+                        self._add_checkable_item(display_name, target_path, lnk_path, checked=True)
+                        added_paths.add(safe_resolve_str(target_path))
+                    elif path.exists():
+                        display_name = names_overrides.get(p) or item_display_name(path)
+                        self._add_checkable_item(display_name, path, checked=True)
+                        added_paths.add(safe_resolve_str(path))
+                for name, target_path, lnk_path in desktop_items:
+                    if safe_resolve_str(target_path) not in added_paths:
+                        self._add_checkable_item(name, target_path, lnk_path, checked=False)
+            else:
+                for name, target_path, lnk_path in desktop_items:
+                    self._add_checkable_item(name, target_path, lnk_path, checked=False)
             self.update_create_button_state()
             announce_speech(tr("scan_completed_count", count=self.shortcuts_list.count()))
         except Exception:
@@ -1448,7 +1962,7 @@ class WidgetCreationWizardDialog(QDialog):
         if not selected_items:
             announce_speech(tr("no_items_selected"))
             return
-        if desktop_shortcuts_to_clean and not self.is_editing:
+        if desktop_shortcuts_to_clean:
             if not self._confirm_clean_desktop_shortcuts(desktop_shortcuts_to_clean):
                 return
         try:
@@ -1486,6 +2000,8 @@ class DesktopOrganizerWindow(QMainWindow):
         self.init_ui()
         self.load_saved_widgets()
         self._update_worker = None
+        self._exit_confirmed = False
+        self._exit_confirm_open = False
         self.start_auto_update_check()
     def init_ui(self):
         central_widget = QWidget()
@@ -1495,6 +2011,7 @@ class DesktopOrganizerWindow(QMainWindow):
         self.add_widget_btn = self._add_button(buttons_top_layout, "create_widget_btn", "create_widget_acc", QKeySequence("Alt+C"), self.open_creation_wizard)
         self.edit_widget_btn = self._add_button(buttons_top_layout, "edit_widget_btn", "edit_widget_acc", QKeySequence("Alt+E"), self.open_edit_wizard)
         self.delete_widget_btn = self._add_button(buttons_top_layout, "delete_widget_btn", "delete_widget_acc", QKeySequence(Qt.Key.Key_Delete), self.delete_selected_widget)
+        self.shortcut_btn = self._add_button(buttons_top_layout, "create_shortcut_btn", "create_shortcut_acc", QKeySequence("Alt+K"), self.create_shortcut_for_selected_widget)
         self.settings_btn = self._add_button(buttons_top_layout, "settings_btn", "settings_acc", QKeySequence("Alt+S"), self.open_settings)
         self.exit_btn = self._add_button(buttons_top_layout, "exit_btn", "exit_acc", QKeySequence("Alt+Q"), self.exit_application)
         main_layout.addLayout(buttons_top_layout)
@@ -1502,6 +2019,13 @@ class DesktopOrganizerWindow(QMainWindow):
         self.widgets_list.itemActivated.connect(self.open_widget_view)
         self.widgets_list.itemChanged.connect(self.update_delete_button_label)
         self.widgets_list.currentRowChanged.connect(self.update_delete_button_label)
+        # Context menu (right-click) on a widget: create its desktop shortcut.
+        self.widgets_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.widgets_list.customContextMenuRequested.connect(self.show_widget_context_menu)
+        self.widget_shortcut_action = QAction(tr("create_shortcut_btn"), self)
+        self.widget_shortcut_action.triggered.connect(self.create_shortcut_for_selected_widget)
+        self.widgets_menu = QMenu(self)
+        self.widgets_menu.addAction(self.widget_shortcut_action)
         main_layout.addWidget(self.widgets_list)
         self.setCentralWidget(central_widget)
         self.statusBar().showMessage(tr("ready_status"))
@@ -1513,7 +2037,10 @@ class DesktopOrganizerWindow(QMainWindow):
     def _add_button(self, layout, text_key: str, acc_key: str, shortcut, slot) -> QPushButton:
         """Create a translated button with an accessible shortcut."""
         btn = QPushButton(tr(text_key))
-        btn.setAutoDefault(False)
+        # autoDefault lets keyboard/screen reader users activate the button
+        # with Enter while it has focus; with autoDefault disabled Enter is
+        # ignored and nothing happens.
+        btn.setAutoDefault(True)
         btn.setShortcut(shortcut)
         btn.setAccessibleName(tr(acc_key))
         btn.clicked.connect(slot)
@@ -1550,11 +2077,13 @@ class DesktopOrganizerWindow(QMainWindow):
         for btn, text_key, acc_key in (
             (self.add_widget_btn, "create_widget_btn", "create_widget_acc"),
             (self.edit_widget_btn, "edit_widget_btn", "edit_widget_acc"),
+            (self.shortcut_btn, "create_shortcut_btn", "create_shortcut_acc"),
             (self.settings_btn, "settings_btn", "settings_acc"),
             (self.exit_btn, "exit_btn", "exit_acc"),
         ):
             btn.setText(tr(text_key))
             btn.setAccessibleName(tr(acc_key))
+        self.widget_shortcut_action.setText(tr("create_shortcut_btn"))
         self.update_delete_button_label()
         self.version_label.setAccessibleName(f"{tr('app_title')} {APP_VERSION}")
         self.statusBar().showMessage(tr("ready_status"))
@@ -1568,15 +2097,31 @@ class DesktopOrganizerWindow(QMainWindow):
         else:
             event.ignore()
     def _confirm_exit_if_needed(self):
+        """Return True when the app may close. The confirmation dialog is
+        shown at most once per run: a repeated close/exit request (for
+        example a second click on the window's close button) must not open a
+        second dialog, and once the user has confirmed, exit proceeds
+        without asking again."""
+        if self._exit_confirmed:
+            return True
+        if self._exit_confirm_open:
+            return False  # a confirmation is already on screen; ignore repeats
         settings = load_settings()
         if not settings.get("confirm_exit", True):
             return True
-        dialog = ExitConfirmDialog(parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        self._exit_confirm_open = True
+        dialog = None
+        accepted = False
+        try:
+            dialog = ExitConfirmDialog(parent=self)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._exit_confirm_open = False
+        if accepted and dialog is not None:
+            self._exit_confirmed = True
             settings["confirm_exit"] = dialog.ask_on_exit_cb.isChecked()
             save_settings(settings)
-            return True
-        return False
+        return accepted
     def exit_application(self):
         """Really quit the program."""
         if self._confirm_exit_if_needed():
@@ -1638,6 +2183,28 @@ class DesktopOrganizerWindow(QMainWindow):
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(Qt.CheckState.Unchecked)
         self.widgets_list.addItem(item)
+    def show_widget_context_menu(self, pos):
+        """Right-click menu on a widget: create/refresh its desktop shortcut."""
+        item = self.widgets_list.itemAt(pos)
+        if item is None:
+            return
+        if item not in self.widgets_list.selectedItems():
+            self.widgets_list.setCurrentItem(item)
+        self.widgets_menu.exec(self.widgets_list.viewport().mapToGlobal(pos))
+    def create_shortcut_for_selected_widget(self):
+        """Create (or refresh) the desktop shortcut for the selected widget."""
+        current_item = self.widgets_list.currentItem()
+        if current_item is None:
+            announce_speech(tr("select_widget_first"))
+            return
+        widget_name = current_item.data(Qt.ItemDataRole.UserRole)
+        if not widget_name:
+            announce_speech(tr("select_widget_first"))
+            return
+        if create_desktop_shortcut(widget_name):
+            announce_speech(tr("shortcut_created_announce", name=widget_name))
+        else:
+            announce_speech(tr("shortcut_unavailable_announce"))
     def open_widget_view(self, item):
         widget_name = item.data(Qt.ItemDataRole.UserRole)
         if widget_name:
@@ -1686,40 +2253,54 @@ class DesktopOrganizerWindow(QMainWindow):
             return
         names_str = ", ".join(f"'{w}'" for w in checked_widgets)
         msg_text = (
-            tr("delete_confirm_multi", names=names_str)
+            tr("delete_choice_multi", names=names_str)
             if len(checked_widgets) > 1
-            else tr("delete_confirm_single", name=checked_widgets[0])
+            else tr("delete_choice_single", name=checked_widgets[0])
         )
         msg_box = _message_box(self, tr("delete_confirm_title"), msg_text)
-        yes_btn = msg_box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
-        no_btn = msg_box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
-        msg_box.setDefaultButton(no_btn)
+        full_btn = msg_box.addButton(tr("delete_widget_full_btn"), QMessageBox.ButtonRole.YesRole)
+        shortcut_btn = msg_box.addButton(tr("delete_shortcut_only_btn"), QMessageBox.ButtonRole.NoRole)
+        cancel_btn = msg_box.addButton(tr("cancel"), QMessageBox.ButtonRole.RejectRole)
+        # The safer action (keep the widget, remove only the shortcut) is the
+        # default, so Enter never destroys a widget by accident.
+        msg_box.setDefaultButton(shortcut_btn)
         announce_speech(msg_text)
         msg_box.exec()
-        if msg_box.clickedButton() == yes_btn:
-            try:
-                data = load_widgets_data()
-                for widget_name in checked_widgets:
-                    data.pop(widget_name, None)
-                save_widgets_data(data)
-            except Exception:
-                pass
-            try:
-                names_data = load_item_names()
-                changed = False
-                for widget_name in checked_widgets:
-                    if widget_name in names_data:
-                        del names_data[widget_name]
-                        changed = True
-                if changed:
-                    save_item_names(names_data)
-            except Exception:
-                pass
+        clicked = msg_box.clickedButton()
+        if clicked is None or clicked == cancel_btn:
+            return
+        if clicked == shortcut_btn:
+            # Remove only the desktop shortcut(s); the widgets stay in the app.
+            results = [delete_desktop_shortcut(w) for w in checked_widgets]
+            if not any(results):
+                announce_speech(tr("shortcut_unavailable_announce"))
+                return
+            announce_speech(tr("shortcut_deleted_announce", name=names_str))
+            return
+        # clicked == full_btn: remove the widgets completely (data + shortcut).
+        try:
+            data = load_widgets_data()
             for widget_name in checked_widgets:
-                delete_desktop_shortcut(widget_name)
-            self.load_saved_widgets()
-            self.widgets_list.setFocus()
-            announce_speech(tr("deleted_count_announce", count=len(checked_widgets)))
+                data.pop(widget_name, None)
+            save_widgets_data(data)
+        except Exception:
+            pass
+        try:
+            names_data = load_item_names()
+            changed = False
+            for widget_name in checked_widgets:
+                if widget_name in names_data:
+                    del names_data[widget_name]
+                    changed = True
+            if changed:
+                save_item_names(names_data)
+        except Exception:
+            pass
+        for widget_name in checked_widgets:
+            delete_desktop_shortcut(widget_name)
+        self.load_saved_widgets()
+        self.widgets_list.setFocus()
+        announce_speech(tr("deleted_count_announce", count=len(checked_widgets)))
 def main():
     app = QApplication(sys.argv)
     # Keep desktop widget shortcuts working across version updates: repoint
@@ -1739,6 +2320,10 @@ def main():
             settings = load_settings()
             settings["language"] = language_dialog.selected_language
             save_settings(settings)
+        else:
+            # The user cancelled the first-run language choice: close the
+            # app instead of silently continuing with the default language.
+            return
     window = DesktopOrganizerWindow()
     window.show()
     sys.exit(app.exec())
