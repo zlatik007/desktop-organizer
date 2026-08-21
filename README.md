@@ -24,6 +24,8 @@ On first launch, the app asks you to choose the interface language.
 
 ## Documentation
 
+Full documentation is available in the following languages:
+
 - **English** — [readme_eng.md](docs/english/readme_eng.md)
 - **Русский** — [readme_ru.md](docs/russian/readme_ru.md)
 
