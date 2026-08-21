@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QDialog,
     QMenu)
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 # Name of the source script. Used to recognize widget shortcuts that a dev
 # (source-code) run left bound to python, so the packaged app can reclaim
 # them and the widget launches the installed program instead of the source.
@@ -954,6 +954,13 @@ def repair_orphaned_desktop_shortcuts():
                 _write_desktop_shortcut(p, widget_name)
             except Exception:
                 pass
+class ShortcutRepairWorker(QThread):
+    """Repoint desktop widget shortcuts to the running copy without blocking
+    startup. The repair resolves every .lnk on the desktop via PowerShell,
+    which is slow when there are many shortcuts, so it runs in the
+    background after the main window appears."""
+    def run(self):
+        repair_orphaned_desktop_shortcuts()
 def delete_desktop_shortcut(widget_name: str) -> bool:
     """Remove the desktop shortcut(s) for a widget. Returns True when the
     removal was attempted; False when the running copy may not manage
@@ -2011,7 +2018,6 @@ class DesktopOrganizerWindow(QMainWindow):
         self.add_widget_btn = self._add_button(buttons_top_layout, "create_widget_btn", "create_widget_acc", QKeySequence("Alt+C"), self.open_creation_wizard)
         self.edit_widget_btn = self._add_button(buttons_top_layout, "edit_widget_btn", "edit_widget_acc", QKeySequence("Alt+E"), self.open_edit_wizard)
         self.delete_widget_btn = self._add_button(buttons_top_layout, "delete_widget_btn", "delete_widget_acc", QKeySequence(Qt.Key.Key_Delete), self.delete_selected_widget)
-        self.shortcut_btn = self._add_button(buttons_top_layout, "create_shortcut_btn", "create_shortcut_acc", QKeySequence("Alt+K"), self.create_shortcut_for_selected_widget)
         self.settings_btn = self._add_button(buttons_top_layout, "settings_btn", "settings_acc", QKeySequence("Alt+S"), self.open_settings)
         self.exit_btn = self._add_button(buttons_top_layout, "exit_btn", "exit_acc", QKeySequence("Alt+Q"), self.exit_application)
         main_layout.addLayout(buttons_top_layout)
@@ -2033,7 +2039,6 @@ class DesktopOrganizerWindow(QMainWindow):
         self.version_label.setObjectName("versionLabel")
         self.version_label.setAccessibleName(f"{tr('app_title')} {APP_VERSION}")
         self.statusBar().addPermanentWidget(self.version_label)
-        announce_speech(tr("app_started_announce"))
     def _add_button(self, layout, text_key: str, acc_key: str, shortcut, slot) -> QPushButton:
         """Create a translated button with an accessible shortcut."""
         btn = QPushButton(tr(text_key))
@@ -2071,13 +2076,15 @@ class DesktopOrganizerWindow(QMainWindow):
             settings["close_widget_on_launch"] = dialog.close_widget_on_launch
             save_settings(settings)
             self.retranslate_ui()
-            announce_speech(tr("lang_changed"))
+            # Announce a language change only when the user actually picked a
+            # different language, not on every OK click.
+            if dialog.selected_language != dialog._original_lang:
+                announce_speech(tr("lang_changed"))
     def retranslate_ui(self):
         self.setWindowTitle(f"{tr('app_title')} {APP_VERSION}")
         for btn, text_key, acc_key in (
             (self.add_widget_btn, "create_widget_btn", "create_widget_acc"),
             (self.edit_widget_btn, "edit_widget_btn", "edit_widget_acc"),
-            (self.shortcut_btn, "create_shortcut_btn", "create_shortcut_acc"),
             (self.settings_btn, "settings_btn", "settings_acc"),
             (self.exit_btn, "exit_btn", "exit_acc"),
         ):
@@ -2303,9 +2310,9 @@ class DesktopOrganizerWindow(QMainWindow):
         announce_speech(tr("deleted_count_announce", count=len(checked_widgets)))
 def main():
     app = QApplication(sys.argv)
-    # Keep desktop widget shortcuts working across version updates: repoint
-    # any shortcuts that still target an old, missing copy of the program.
-    repair_orphaned_desktop_shortcuts()
+    # Desktop widget shortcuts are repaired by ShortcutRepairWorker in the
+    # background after the main window appears (see below); running the
+    # repair here blocks startup with slow PowerShell calls.
     if len(sys.argv) > 1:
         widget_name = sys.argv[1]
         try:
@@ -2326,6 +2333,12 @@ def main():
             return
     window = DesktopOrganizerWindow()
     window.show()
+    # The shortcut repair spawns PowerShell once per batch of desktop
+    # shortcuts; running it here would stall startup on a busy desktop.
+    # Do it in the background so the window appears immediately.
+    repair_worker = ShortcutRepairWorker()
+    repair_worker.finished.connect(repair_worker.deleteLater)
+    repair_worker.start()
     sys.exit(app.exec())
 if __name__ == "__main__":
     main()

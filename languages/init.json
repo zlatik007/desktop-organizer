@@ -1,4 +1,5 @@
 {
+    "app_title": "Desktop Organizer",
     "create_widget_btn": "&Create Widget",
     "create_widget_acc": "Create new desktop widget",
     "edit_widget_btn": "&Edit Widget",
@@ -122,6 +123,7 @@
     "select_widget_first": "Please select a widget first.",
     "widget_updated_announce": "Widget {name} successfully updated",
     "no_widgets_selected": "No widgets selected.",
+    "unavailable": "unavailable",
     "attention_title": "Attention",
     "delete_confirm_title": "Confirm Deletion",
     "delete_choice_single": "What do you want to do with widget '{name}'?",

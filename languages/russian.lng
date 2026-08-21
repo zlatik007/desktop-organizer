@@ -1,4 +1,5 @@
 {
+    "app_title": "Организатор рабочего стола",
     "create_widget_btn": "Создать (&C)",
     "create_widget_acc": "Создать виджет",
     "edit_widget_btn": "Изменить (&)",
@@ -122,6 +123,7 @@
     "select_widget_first": "Пожалуйста, сначала выберите виджет.",
     "widget_updated_announce": "Виджет {name} успешно обновлён",
     "no_widgets_selected": "Не выбрано ни одного виджета.",
+    "unavailable": "недоступно",
     "attention_title": "Внимание",
     "delete_confirm_title": "Подтверждение удаления",
     "delete_choice_single": "Что вы хотите сделать с виджетом «{name}»?",
