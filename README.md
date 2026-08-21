@@ -1,7 +1,5 @@
 # Desktop Organizer
 
-[English](README.md) | [Русский](README.ru.md)
-
 **Desktop Organizer** is a Windows application that helps you declutter your desktop by organizing files, folders, and shortcuts into customizable groups called **"widgets"**. Stop searching through a messy desktop — launch what you need in just a few clicks.
 
 ## Features
