@@ -24,37 +24,10 @@
 
 On first launch, the app asks you to choose the interface language.
 
-## Quick Start
-
-1. Click **"Create Widget"** or press `Alt+C`
-2. Enter a widget name (e.g., "Work", "Games")
-3. The app automatically scans the shortcuts on your desktop — check the items you want
-4. Click **"Create"** — a widget shortcut appears on your desktop
-
-You can open widgets from the main window or from their desktop shortcut. Full instructions are in the [documentation](#documentation).
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-| --- | --- |
-| `Alt+C` | Create a new widget |
-| `Alt+E` | Edit the selected widget |
-| `Delete` | Delete the selected widget |
-| `Alt+S` | Open settings |
-| `Alt+Q` | Exit the application |
-| `F2` | Rename the selected item (in widget view) |
-| `Enter` | Launch the selected item (in widget view) |
-
 ## Documentation
 
 - **English** — [readme_eng.md](docs/english/readme_eng.md)
 - **Русский** — [readme_ru.md](docs/russian/readme_ru.md)
-
-## Support
-
-- **Email:** [zlata20042707@gmail.com](mailto:zlata20042707@gmail.com)
-- **Telegram:** [@Zlatik_007](https://t.me/Zlatik_007)
-- **GitHub:** [create an issue](https://github.com/zlatik007/desktop_organizer/issues)
 
 ## License
 
